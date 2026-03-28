@@ -1,18 +1,16 @@
-from __future__ import annotations
-
 import asyncio
 from contextlib import suppress
 from time import monotonic_ns
 
-from .audio import MicrophoneInput
-from .turn_detector import InterruptEvent, TurnDetector
+from hackathon.audio import MicrophoneInput
+from hackathon.turn_detector import InterruptEvent, TurnDetector
 
 
-class TurnDetectionServiceError(RuntimeError):
+class InterruptServiceError(RuntimeError):
     """Raised when the live turn-detection service cannot continue."""
 
 
-class TurnDetectionService:
+class InterruptService:
     """Continuously feeds a passive detector from a shared live microphone."""
 
     def __init__(
@@ -54,7 +52,7 @@ class TurnDetectionService:
             return
 
         if not self.microphone_input.is_started:
-            msg = "MicrophoneInput must be started before TurnDetectionService."
+            msg = "MicrophoneInput must be started before InterruptService."
             raise RuntimeError(msg)
 
         self._loop = asyncio.get_running_loop()
@@ -81,7 +79,7 @@ class TurnDetectionService:
         if self._terminal_error is not None:
             raise self._terminal_error
         if not self.is_started or self._loop is None:
-            msg = "TurnDetectionService must be started before waiting for an interrupt window."
+            msg = "InterruptService must be started before waiting for an interrupt window."
             raise RuntimeError(msg)
 
         pending_wait = self._pending_wait
@@ -114,14 +112,14 @@ class TurnDetectionService:
             raise
         except Exception as exc:
             self._handle_terminal_error(
-                TurnDetectionServiceError(
+                InterruptServiceError(
                     f"Turn detection lost its microphone subscription: {exc}",
                 ),
             )
             return
 
         self._handle_terminal_error(
-            TurnDetectionServiceError("Turn detection microphone subscription ended unexpectedly."),
+            InterruptServiceError("Turn detection microphone subscription ended unexpectedly."),
         )
 
     def _resolve_pending_wait(self, event: InterruptEvent) -> None:
@@ -142,4 +140,3 @@ class TurnDetectionService:
     @staticmethod
     def _monotonic_ms() -> int:
         return monotonic_ns() // 1_000_000
-

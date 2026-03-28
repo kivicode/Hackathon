@@ -234,16 +234,9 @@ class MicrophoneInput:
             await asyncio.to_thread(self._stop_and_close_stream, stream)
 
     def _audio_callback(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
-        del time_info
+        del time_info, status
 
         if not self._started or self._loop is None:
-            return
-
-        if status:
-            error = MicrophoneInputError(f"Microphone input reported callback status: {status}")
-            self._loop.call_soon_threadsafe(self._schedule_shutdown, error)
-            if self._callback_abort is not None:
-                raise self._callback_abort
             return
 
         try:
