@@ -12,6 +12,7 @@ dependencies = [
     "pydantic-settings>=2.13.1",
     "sounddevice>=0.5.0",
     "numpy>=2.0.0",
+    "lightrag-hku>=1.0.0",
 ]
 
 

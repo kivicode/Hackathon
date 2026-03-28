@@ -166,6 +166,7 @@ cython_debug/
 
 .DS_Store
 DevExperiment
+rag_storage/
 __workspace__
 .history
 
