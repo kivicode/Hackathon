@@ -1,3 +1,5 @@
+from collections.abc import AsyncIterator
+
 from hackathon.voiceover.audio import open_stream, play_audio, write_chunk
 from hackathon.voiceover.tts import create_client, text_to_speech_stream
 
@@ -14,7 +16,7 @@ if __name__ == "__main__":
         "It is not production-ready yet."
     )
 
-    async def word_stream(text: str):
+    async def word_stream(text: str) -> AsyncIterator[str]:
         for word in text.split():
             yield word + " "
             await asyncio.sleep(0.05)

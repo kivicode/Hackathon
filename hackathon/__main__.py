@@ -20,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def run() -> None:
+async def run() -> None:  # noqa: PLR0915
     settings = ProjectSettings()
     loop = asyncio.get_event_loop()
 
