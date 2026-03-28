@@ -2,27 +2,7 @@ from dataclasses import dataclass
 
 import webrtcvad
 
-_FRAME_MS = 20
-_BYTES_PER_SAMPLE = 2
-_SUPPORTED_SAMPLE_RATES = frozenset({8000, 16000, 32000, 48000})
-
-
-@dataclass(frozen=True)
-class AudioChunk:
-    """Decoded audio passed into the turn detector.
-
-    Attributes:
-        pcm_s16le: Contiguous mono 16-bit little-endian PCM bytes.
-        timestamp_ms: Monotonic start timestamp for this chunk in milliseconds.
-
-    Notes:
-        Chunks are expected to be contiguous in time. If a chunk does not align
-        to the detector's internal 20 ms frame size, later chunks are assumed
-        to continue immediately after the buffered remainder.
-    """
-
-    pcm_s16le: bytes
-    timestamp_ms: int
+from .audio import BYTES_PER_SAMPLE, FRAME_MS, SUPPORTED_SAMPLE_RATES, AudioChunk
 
 
 @dataclass(frozen=True)
@@ -65,10 +45,10 @@ class TurnDetector:
         max_wait_ms: int = 10_000,
         vad_mode: int = 2,
     ) -> None:
-        if sample_rate_hz not in _SUPPORTED_SAMPLE_RATES:
+        if sample_rate_hz not in SUPPORTED_SAMPLE_RATES:
             msg = (
                 "sample_rate_hz must be one of "
-                f"{sorted(_SUPPORTED_SAMPLE_RATES)}, got {sample_rate_hz}"
+                f"{sorted(SUPPORTED_SAMPLE_RATES)}, got {sample_rate_hz}"
             )
             raise ValueError(msg)
         if silence_ms <= 0:
@@ -87,7 +67,7 @@ class TurnDetector:
         self.vad_mode = vad_mode
 
         self._vad = webrtcvad.Vad(vad_mode)
-        self._frame_bytes = self._samples_to_bytes(sample_rate_hz * _FRAME_MS // 1000)
+        self._frame_bytes = self._samples_to_bytes(sample_rate_hz * FRAME_MS // 1000)
         self.reset()
 
     def feed(self, chunk: AudioChunk) -> InterruptEvent | None:
@@ -99,7 +79,7 @@ class TurnDetector:
         still wants ``max_wait_ms`` to advance, it may call ``feed()`` with an
         empty ``pcm_s16le`` payload and an updated timestamp.
         """
-        if len(chunk.pcm_s16le) % _BYTES_PER_SAMPLE != 0:
+        if len(chunk.pcm_s16le) % BYTES_PER_SAMPLE != 0:
             msg = "pcm_s16le must contain whole 16-bit samples"
             raise ValueError(msg)
 
@@ -167,7 +147,7 @@ class TurnDetector:
             frame_pcm = bytes(self._pending_pcm[: self._frame_bytes])
             del self._pending_pcm[: self._frame_bytes]
             frames.append((frame_pcm, frame_timestamp_ms))
-            frame_timestamp_ms += _FRAME_MS
+            frame_timestamp_ms += FRAME_MS
 
         self._pending_start_ms = frame_timestamp_ms if self._pending_pcm else None
         return frames
@@ -190,7 +170,7 @@ class TurnDetector:
             self._consecutive_silence_ms = 0
 
         self._last_frame_was_speech = False
-        self._consecutive_silence_ms += _FRAME_MS
+        self._consecutive_silence_ms += FRAME_MS
 
         if (event_timestamp_ms := self._interrupt_timestamp_for_current_silence()) is None:
             return None
@@ -238,4 +218,4 @@ class TurnDetector:
 
     @staticmethod
     def _samples_to_bytes(sample_count: int) -> int:
-        return sample_count * _BYTES_PER_SAMPLE
+        return sample_count * BYTES_PER_SAMPLE
