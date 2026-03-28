@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,10 +14,13 @@ from textual.containers import Container
 from textual.widgets import Label, RichLog, Static
 
 from hackathon.agent import MeetingAgent, TranscriptChunk
+from hackathon.audio import MicrophoneInput
 from hackathon.config import ProjectSettings
+from hackathon.interrupt_service import InterruptService
+from hackathon.turn_detector import TurnDetector
 from hackathon.rag.light import LightRAGBackend
 from hackathon.rag.stuffing import StuffingRAG
-from hackathon.stt import ResumableMicrophoneStream, generate_transcripts
+from hackathon.stt import generate_transcripts
 from hackathon.voiceover.audio import open_stream, write_chunk
 from hackathon.voiceover.tts import create_client, text_to_speech_stream
 
@@ -48,6 +52,11 @@ Screen {
 #interim {
     height: 1;
     color: $text-muted;
+    padding: 0 2;
+}
+
+#turn-indicator {
+    height: 1;
     padding: 0 2;
 }
 
@@ -91,6 +100,7 @@ class MeetingUI(App):
         yield Static(BANNER, id="banner")
         yield RichLog(id="transcript-log", wrap=True, markup=True)
         yield Static("", id="interim")
+        yield Static("", id="turn-indicator")
         with Container(id="alert-container"):
             yield Label("", id="alert-box")
         yield Static("Initializing...", id="status")
@@ -116,16 +126,69 @@ class MeetingUI(App):
     def _hide_alert(self) -> None:
         self.query_one("#alert-container").remove_class("visible")
 
+    def set_turn_indicator(self, state: str) -> None:
+        indicator = self.query_one("#turn-indicator", Static)
+        if state == "waiting":
+            indicator.update("[bold orange3]>> Correction ready — waiting for pause to speak...[/bold orange3]")
+        elif state == "speaking":
+            indicator.update("[bold green]>> Speaking correction[/bold green]")
+        elif state == "speech":
+            indicator.update("[bold red]  SPEECH DETECTED[/bold red]")
+        elif state == "silence":
+            indicator.update("[dim]  silence — agent can interject[/dim]")
+        else:
+            indicator.update("")
+
     def set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
 
-    async def _pipeline(self) -> None:
+    async def _pipeline(self) -> None:  # noqa: PLR0915
         settings = ProjectSettings()
         loop = asyncio.get_event_loop()
 
         # -- TTS --
         tts_client = create_client(settings)
         audio_out = open_stream(settings.audio_device, settings.sample_rate)
+
+        # -- Shared mic (single source for both STT and turn detector) --
+        mic_input = MicrophoneInput(sample_rate_hz=16000)
+        await mic_input.start()
+
+        interrupt_svc = InterruptService(mic_input)
+        await interrupt_svc.start()
+
+        # -- Bridge: async MicrophoneInput subscriber → sync queue for STT --
+        audio_queue: queue.Queue[bytes | None] = queue.Queue()
+
+        async def _mic_to_stt_bridge() -> None:
+            """Forward mic audio chunks to the sync STT queue."""
+            async for chunk in mic_input.subscribe():
+                audio_queue.put(chunk.pcm_s16le)
+            audio_queue.put(None)
+
+        bridge_task = asyncio.create_task(_mic_to_stt_bridge())
+
+        # -- VAD indicator: uses TurnDetector to show speech/silence --
+        vad_detector = TurnDetector(sample_rate_hz=mic_input.sample_rate_hz)
+
+        async def _vad_monitor() -> None:
+            last_state = ""
+            async for chunk in mic_input.subscribe():
+                vad_detector.feed(chunk)
+                state = "speech" if vad_detector._last_frame_was_speech else "silence"
+                if state != last_state:
+                    last_state = state
+                    self.set_turn_indicator(state)
+
+        vad_task = asyncio.create_task(_vad_monitor())
+
+        def _audio_generator():
+            """Sync generator that reads from the audio queue."""
+            while True:
+                data = audio_queue.get()
+                if data is None:
+                    return
+                yield data
 
         # -- Agent + RAG --
         knowledge = ""
@@ -147,16 +210,15 @@ class MeetingUI(App):
         agent = MeetingAgent(settings=settings, knowledge_base=knowledge, rag=rag)
         self.set_status("Listening...")
 
-        # -- STT thread → queue --
+        # -- STT in background thread (reads from shared mic via bridge) --
         transcript_queue: asyncio.Queue[TranscriptChunk | None] = asyncio.Queue()
 
         def _put(chunk: TranscriptChunk | None) -> None:
             loop.call_soon_threadsafe(transcript_queue.put_nowait, chunk)
 
         def _stt_worker() -> None:
-            mic = ResumableMicrophoneStream()
             try:
-                for event in generate_transcripts(mic.generator()):
+                for event in generate_transcripts(_audio_generator()):
                     if event.is_final:
                         chunk = TranscriptChunk(
                             speaker="Speaker",
@@ -167,10 +229,9 @@ class MeetingUI(App):
                         self.call_from_thread(self.add_final, event.text.strip())
                     else:
                         self.call_from_thread(self.show_interim, event.text.strip())
-            except KeyboardInterrupt:
-                pass
+            except Exception:
+                logger.exception("STT worker error")
             finally:
-                mic.close()
                 _put(None)
 
         loop.run_in_executor(None, _stt_worker)
@@ -192,14 +253,26 @@ class MeetingUI(App):
                     continue
                 if correction:
                     self.show_alert(correction)
+                    self.set_turn_indicator("waiting")
+                    self.set_status("Waiting for pause...")
+                    try:
+                        await interrupt_svc.wait_for_interrupt_window()
+                    except Exception:
+                        logger.warning("Turn detector error, speaking immediately")
+                    self.set_turn_indicator("speaking")
                     self.set_status("Speaking correction...")
                     try:
                         async for audio_chunk in text_to_speech_stream(tts_client, correction, settings):
                             write_chunk(audio_out, audio_chunk)
                     except Exception:
                         logger.exception("TTS error")
+                    self.set_turn_indicator("")
                 self.set_status("Listening...")
         finally:
+            vad_task.cancel()
+            bridge_task.cancel()
+            await interrupt_svc.stop()
+            await mic_input.stop()
             audio_out.stop()
             audio_out.close()
 

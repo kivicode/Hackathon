@@ -73,7 +73,12 @@ class ResumableMicrophoneStream:
 
 
 def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[TranscriptEvent]:
-    """Consume Google Speech API responses and yield transcript events (interim + final)."""
+    """Consume Google Speech API responses and yield transcript events.
+
+    Auto-reconnects on timeout errors (e.g. when audio pauses during TTS playback).
+    """
+    from google.api_core.exceptions import OutOfRange
+
     client = speech.SpeechClient()
 
     config = speech.RecognitionConfig(
@@ -88,19 +93,26 @@ def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[Transcr
         interim_results=True,
     )
 
-    requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in stream_generator)
-    responses = client.streaming_recognize(streaming_config, requests)
+    while True:
+        requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in stream_generator)
+        responses = client.streaming_recognize(streaming_config, requests)
 
-    for response in responses:
-        if not response.results:
+        try:
+            for response in responses:
+                if not response.results:
+                    continue
+                result = response.results[0]
+                if not result.alternatives:
+                    continue
+                yield TranscriptEvent(
+                    text=result.alternatives[0].transcript,
+                    is_final=result.is_final,
+                )
+        except OutOfRange:
+            logger.warning("STT timeout, reconnecting...")
             continue
-        result = response.results[0]
-        if not result.alternatives:
-            continue
-        yield TranscriptEvent(
-            text=result.alternatives[0].transcript,
-            is_final=result.is_final,
-        )
+        else:
+            break
 
 
 if __name__ == "__main__":

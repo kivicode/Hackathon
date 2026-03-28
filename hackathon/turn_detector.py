@@ -44,6 +44,7 @@ class TurnDetector:
         silence_ms: int = 700,
         max_wait_ms: int = 10_000,
         vad_mode: int = 2,
+        debounce_ms: int = 300,
     ) -> None:
         if sample_rate_hz not in SUPPORTED_SAMPLE_RATES:
             msg = (
@@ -65,6 +66,7 @@ class TurnDetector:
         self.silence_ms = silence_ms
         self.max_wait_ms = max_wait_ms
         self.vad_mode = vad_mode
+        self._debounce_frames = max(1, debounce_ms // FRAME_MS)
 
         self._vad = webrtcvad.Vad(vad_mode)
         self._frame_bytes = self._samples_to_bytes(sample_rate_hz * FRAME_MS // 1000)
@@ -128,6 +130,10 @@ class TurnDetector:
         self._silence_start_ms: int | None = None
         self._last_frame_was_speech = False
 
+        # Debounce state
+        self._raw_speech_count = 0
+        self._raw_silence_count = 0
+
         self._request_timestamp_ms: int | None = None
         self._request_deadline_ms: int | None = None
 
@@ -153,10 +159,30 @@ class TurnDetector:
         return frames
 
     def _process_frame(self, frame_pcm: bytes, frame_timestamp_ms: int) -> InterruptEvent | None:
-        if self._vad.is_speech(frame_pcm, self.sample_rate_hz):
-            self._handle_speech_frame()
+        raw_is_speech = self._vad.is_speech(frame_pcm, self.sample_rate_hz)
+
+        if raw_is_speech:
+            self._raw_speech_count += 1
+            self._raw_silence_count = 0
+        else:
+            self._raw_silence_count += 1
+            self._raw_speech_count = 0
+
+        # Only transition after enough consecutive frames agree
+        if raw_is_speech and not self._last_frame_was_speech:
+            if self._raw_speech_count >= self._debounce_frames:
+                self._handle_speech_frame()
             return None
 
+        if not raw_is_speech and self._last_frame_was_speech:
+            if self._raw_silence_count >= self._debounce_frames:
+                return self._handle_silence_frame(frame_timestamp_ms)
+            return None
+
+        # Steady state
+        if raw_is_speech:
+            self._handle_speech_frame()
+            return None
         return self._handle_silence_frame(frame_timestamp_ms)
 
     def _handle_speech_frame(self) -> None:
