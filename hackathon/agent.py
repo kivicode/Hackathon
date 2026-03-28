@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import json
-import logging
 import time
 from collections import deque
 from typing import TYPE_CHECKING
 
 from google import genai
 from google.genai import types
+from loguru import logger
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from hackathon.config import ProjectSettings
-
-logger = logging.getLogger(__name__)
+    from hackathon.rag.base import RAGBackend
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +75,18 @@ Should you intervene? Return JSON."""
 
 
 class MeetingAgent:
-    def __init__(self, settings: ProjectSettings, knowledge_base: str) -> None:
+    def __init__(
+        self,
+        settings: ProjectSettings,
+        knowledge_base: str = "",
+        rag: RAGBackend | None = None,
+    ) -> None:
         self.client = genai.Client(api_key=settings.gemini_api_key)
         self.model = settings.gemini_model
         self.transcript: deque[TranscriptChunk] = deque(maxlen=settings.buffer_size)
         self.confidence_threshold = settings.confidence_threshold
         self._system = SYSTEM_PROMPT.format(knowledge_base=knowledge_base)
+        self._rag = rag
         self._past_corrections: list[str] = []
 
     async def process_chunk(self, chunk: TranscriptChunk) -> str | None:
@@ -89,6 +94,16 @@ class MeetingAgent:
         self.transcript.append(chunk)
 
         past = "\n".join(f"- {c}" for c in self._past_corrections) if self._past_corrections else "(none)"
+
+        # Optionally enrich system prompt with RAG results
+        system = self._system
+        if self._rag:
+            try:
+                rag_context = await self._rag.query(chunk.text)
+                system = system + f"\n\nAdditional context from RAG:\n{rag_context}"
+            except Exception:
+                logger.exception("RAG query failed")
+
         prompt = CHUNK_PROMPT.format(
             context=self._build_context(),
             past_corrections=past,
@@ -96,13 +111,13 @@ class MeetingAgent:
             text=chunk.text,
         )
 
-        logger.info("Sending chunk to agent: speaker=%s text='%s'", chunk.speaker, chunk.text[:80])
+        logger.debug("Sending chunk: speaker={} text='{}'", chunk.speaker, chunk.text[:80])
         t0 = time.monotonic()
 
         response = await self.client.aio.models.generate_content(
             model=self.model,
             contents=[
-                types.Content(role="user", parts=[types.Part(text=self._system)]),
+                types.Content(role="user", parts=[types.Part(text=system)]),
                 types.Content(role="user", parts=[types.Part(text=prompt)]),
             ],
             config=types.GenerateContentConfig(
@@ -113,19 +128,20 @@ class MeetingAgent:
         )
 
         elapsed = time.monotonic() - t0
-        logger.info("Agent response in %.1fs: %s", elapsed, response.text)
+        logger.debug("Agent response in {:.1f}s: {}", elapsed, response.text)
 
         try:
             result = AgentResponse(**json.loads(response.text))
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Failed to parse agent response: %s", response.text)
+            logger.warning("Failed to parse agent response: {}", response.text)
             return None
 
         logger.info(
-            "Decision: intervene=%s confidence=%.2f threshold=%.2f",
+            "intervene={} confidence={:.2f} ({:.1f}s) | {}",
             result.should_intervene,
             result.confidence,
-            self.confidence_threshold,
+            elapsed,
+            chunk.text[:60],
         )
 
         if result.should_intervene and result.confidence >= self.confidence_threshold:
@@ -145,37 +161,36 @@ class MeetingAgent:
 if __name__ == "__main__":
     import asyncio
 
-    from hackathon.config import ProjectSettings
-    from hackathon.rag import load_knowledge_base
+    from pathlib import Path
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from hackathon.config import ProjectSettings
 
     DEMO_TRANSCRIPT = [
         ("CEO", "We've got a lead, XYZ Corp. They're interested in Feature X. I'm meeting them tomorrow, is it ready?"),
         ("CTO", "Yes, we finished it this week."),
         (
             "CTO",
-            "Another point: the Poland team running XYZ service brings in about 3 million a year, but infra costs are 3.5 million. I think we should cut them.",
+            "Another point: the Poland team running XYZ service brings in about 3 million a year, "
+            "but infra costs are 3.5 million. I think we should cut them.",
         ),
         ("CFO", "That seems reasonable."),
     ]
 
     async def main() -> None:
         settings = ProjectSettings()
-        knowledge = load_knowledge_base()
+        data_dir = Path(settings.rag_data_dir)
+        knowledge = "\n\n".join(f"=== {p.name} ===\n{p.read_text()}" for p in sorted(data_dir.glob("*.md")))
         agent = MeetingAgent(settings=settings, knowledge_base=knowledge)
-        print(f"Knowledge base: {len(knowledge)} chars\n")  # noqa: T201
+        logger.info("Knowledge base: {} chars", len(knowledge))
 
         for speaker, text in DEMO_TRANSCRIPT:
-            print(f"\n{'=' * 60}")  # noqa: T201
-            print(f"{speaker}: {text}")  # noqa: T201
-            print(f"{'=' * 60}")  # noqa: T201
+            logger.info("{}: {}", speaker, text)
             correction = await agent.process_chunk(
                 TranscriptChunk(speaker=speaker, text=text),
             )
             if correction:
-                print(f"\n>>> AGENT: {correction}\n")  # noqa: T201
+                logger.success("AGENT: {}", correction)
             else:
-                print("  (no intervention)")  # noqa: T201
+                logger.debug("(no intervention)")
 
     asyncio.run(main())

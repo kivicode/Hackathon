@@ -7,6 +7,7 @@ from collections.abc import Generator, Iterator
 
 import pyaudio
 from google.cloud import speech
+from loguru import logger
 from pydantic import BaseModel
 
 RATE = 16000
@@ -103,13 +104,15 @@ def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[Transcr
 
 
 if __name__ == "__main__":
-    print("Starting audio stream... (Press Ctrl+C to stop)")  # noqa: T201
+    logger.info("Starting audio stream... (Press Ctrl+C to stop)")
     mic_stream = ResumableMicrophoneStream(RATE, CHUNK)
     try:
         for event in generate_transcripts(mic_stream.generator()):
-            tag = "FINAL" if event.is_final else "interim"
-            print(f"[{tag}] {event.text}")  # noqa: T201
+            if event.is_final:
+                logger.info("[FINAL] {}", event.text)
+            else:
+                logger.debug("[interim] {}", event.text)
     except KeyboardInterrupt:
-        print("\nStopping...")  # noqa: T201
+        logger.info("Stopping...")
     finally:
         mic_stream.close()
