@@ -53,7 +53,7 @@ async def _synthesize_one(
     settings: ProjectSettings,
 ) -> AsyncIterator[bytes]:
     """Synthesize a single sentence via Gemini Live API."""
-    async with client.aio.live.connect(model=settings.gemini_model, config=config) as session:
+    async with client.aio.live.connect(model=settings.tts_model, config=config) as session:
         await session.send_realtime_input(text=sentence)
         async for response in session.receive():
             if response.server_content and response.server_content.model_turn:

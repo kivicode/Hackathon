@@ -7,9 +7,15 @@ from collections.abc import Generator, Iterator
 
 import pyaudio
 from google.cloud import speech
+from pydantic import BaseModel
 
 RATE = 16000
 CHUNK = int(RATE / 10)  # 100ms chunks
+
+
+class TranscriptEvent(BaseModel):
+    text: str
+    is_final: bool
 
 
 class ResumableMicrophoneStream:
@@ -38,18 +44,15 @@ class ResumableMicrophoneStream:
         time_info: dict,  # noqa: ARG002
         status_flags: int,  # noqa: ARG002
     ) -> tuple[None, int]:
-        """Continuously collect data from the audio stream into the buffer."""
         self._buff.put(in_data)
         return None, pyaudio.paContinue
 
     def generator(self) -> Generator[bytes]:
-        """Yield audio chunks from the buffer."""
         while not self.closed:
             chunk = self._buff.get()
             if chunk is None:
                 return
             data = [chunk]
-
             while True:
                 try:
                     chunk = self._buff.get(block=False)
@@ -58,7 +61,6 @@ class ResumableMicrophoneStream:
                     data.append(chunk)
                 except queue.Empty:
                     break
-
             yield b"".join(data)
 
     def close(self) -> None:
@@ -69,8 +71,8 @@ class ResumableMicrophoneStream:
         self._audio_interface.terminate()
 
 
-def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[str]:
-    """Consume Google Speech API responses and yield finalized transcript text."""
+def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[TranscriptEvent]:
+    """Consume Google Speech API responses and yield transcript events (interim + final)."""
     client = speech.SpeechClient()
 
     config = speech.RecognitionConfig(
@@ -91,22 +93,22 @@ def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[str]:
     for response in responses:
         if not response.results:
             continue
-
         result = response.results[0]
         if not result.alternatives:
             continue
-
-        if result.is_final:
-            yield result.alternatives[0].transcript
+        yield TranscriptEvent(
+            text=result.alternatives[0].transcript,
+            is_final=result.is_final,
+        )
 
 
 if __name__ == "__main__":
     print("Starting audio stream... (Press Ctrl+C to stop)")  # noqa: T201
     mic_stream = ResumableMicrophoneStream(RATE, CHUNK)
-
     try:
-        for final_sentence in generate_transcripts(mic_stream.generator()):
-            print(f"Received: {final_sentence}")  # noqa: T201
+        for event in generate_transcripts(mic_stream.generator()):
+            tag = "FINAL" if event.is_final else "interim"
+            print(f"[{tag}] {event.text}")  # noqa: T201
     except KeyboardInterrupt:
         print("\nStopping...")  # noqa: T201
     finally:

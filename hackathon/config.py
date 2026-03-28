@@ -11,7 +11,8 @@ class ProjectSettings(BaseSettings):
     )
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
+    tts_model: str = "gemini-3.1-flash-live-preview"
     confidence_threshold: float = 0.7
     buffer_size: int = 200
     voice_name: str = "Kore"
