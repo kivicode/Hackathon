@@ -1,5 +1,7 @@
 # Annual Financial Report — Infrastructure & Service Units
 
+> Source: [Google Sheets](https://docs.google.com/spreadsheets/d/1Nz0KaovwH2uJRO0rbYFXRF82bNMI0jdwseNZtAWTqeA/edit?gid=146781967#gid=146781967)
+
 ## Poland Operations — XYZ Service (Project Kodiak)
 
 ### Revenue vs Infrastructure Costs (Quarterly)

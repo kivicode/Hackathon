@@ -2,17 +2,53 @@
 
 import argparse
 import asyncio
+import os
 import queue
 import sys
+import threading
 import time
+import warnings
+
+# Suppress gRPC C-level debug/info logs (must be set before gRPC C library loads)
+os.environ["GRPC_VERBOSITY"] = "NONE"
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["GRPC_TRACE"] = ""
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
 
 from loguru import logger
+
+# Suppress noisy PortAudio/gRPC stream interruption warnings
+warnings.filterwarnings("ignore", message=".*Exception ignored.*")
+
+
+def _install_exception_hooks() -> None:
+    """Suppress harmless 'exception in stream callback' noise."""
+    _original_excepthook = sys.excepthook
+    _original_threading_excepthook = threading.excepthook
+
+    def _quiet_excepthook(exc_type, exc_value, exc_tb):  # noqa: ANN001
+        msg = str(exc_value).lower()
+        if "stream" in msg or "portaudio" in msg or "callback" in msg:
+            return
+        _original_excepthook(exc_type, exc_value, exc_tb)
+
+    def _quiet_threading_excepthook(args):  # noqa: ANN001
+        msg = str(args.exc_value).lower()
+        if "stream" in msg or "portaudio" in msg or "callback" in msg:
+            return
+        _original_threading_excepthook(args)
+
+    sys.excepthook = _quiet_excepthook
+    threading.excepthook = _quiet_threading_excepthook
+
+
+_install_exception_hooks()
 
 
 def _run_headless() -> None:
     from pathlib import Path
 
-    from hackathon.agent import MeetingAgent, TranscriptChunk
+    from hackathon.agent import SOURCES, MeetingAgent, TranscriptChunk
     from hackathon.audio import MicrophoneInput
     from hackathon.config import ProjectSettings
     from hackathon.interrupt_service import InterruptService
@@ -71,7 +107,7 @@ def _run_headless() -> None:
 
         def _stt_worker() -> None:
             try:
-                for event in generate_transcripts(_audio_gen()):
+                for event in generate_transcripts(_audio_gen(), audio_queue=audio_queue):
                     if event.is_final:
                         _put(TranscriptChunk(speaker="Speaker", text=event.text, timestamp=time.time()))
                         logger.info("STT: {}", event.text.strip())
@@ -93,19 +129,27 @@ def _run_headless() -> None:
                 if not chunk.text.strip():
                     continue
                 try:
-                    correction = await agent.process_chunk(chunk)
+                    result = await agent.process_chunk(chunk)
                 except Exception:
                     logger.exception("Agent error")
                     continue
-                if correction:
-                    logger.success("Correction: {}", correction)
+                if result:
+                    logger.success("Correction: {}", result.correction)
+                    src = SOURCES.get(result.source_key, {})
+                    if src.get("url"):
+                        logger.info("Source: {} — {}", src["alias"], src["url"])
+
+                    logger.info("Generating speech...")
                     try:
-                        await interrupt_svc.wait_for_interrupt_window()
-                    except Exception:
-                        logger.warning("Turn detector error, speaking immediately")
-                    logger.info("Speaking...")
-                    try:
-                        async for audio_chunk in text_to_speech_stream(tts_client, correction, settings):
+                        first_chunk = True
+                        async for audio_chunk in text_to_speech_stream(tts_client, result.correction, settings):
+                            if first_chunk:
+                                first_chunk = False
+                                try:
+                                    await interrupt_svc.wait_for_interrupt_window()
+                                except Exception:
+                                    logger.warning("Turn detector error, speaking immediately")
+                                logger.info("Speaking...")
                             write_chunk(audio_out, audio_chunk)
                     except Exception:
                         logger.exception("TTS error")
@@ -129,6 +173,8 @@ def main() -> None:
     if args.no_ui:
         _run_headless()
     else:
+        # Suppress all loguru output in UI mode — the UI handles display
+        logger.remove()
         from hackathon.ui import MeetingUI
         MeetingUI().run()
 

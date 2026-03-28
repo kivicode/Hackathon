@@ -31,6 +31,7 @@ class ProjectSettings(BaseSettings):
     turn_detector_silence_ms: int = Field(default=700, gt=0)
     turn_detector_max_wait_ms: int = Field(default=10_000, gt=0)
     turn_detector_vad_mode: int = Field(default=2, ge=0, le=3)
+    eager_alert: bool = True  # True = show alert immediately; False = wait for first TTS chunk
 
     def microphone_device_selector(self) -> str | int | None:
         if self.microphone_device is None:

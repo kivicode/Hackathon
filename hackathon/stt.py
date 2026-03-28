@@ -72,12 +72,16 @@ class ResumableMicrophoneStream:
         self._audio_interface.terminate()
 
 
-def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[TranscriptEvent]:
+def generate_transcripts(
+    stream_generator: Iterator[bytes],
+    audio_queue: queue.Queue | None = None,
+) -> Generator[TranscriptEvent]:
     """Consume Google Speech API responses and yield transcript events.
 
-    Auto-reconnects on timeout errors (e.g. when audio pauses during TTS playback).
+    Auto-reconnects on timeout/stream errors. If audio_queue is provided,
+    drains stale data before reconnecting.
     """
-    from google.api_core.exceptions import OutOfRange
+    from google.api_core.exceptions import GoogleAPICallError
 
     client = speech.SpeechClient()
 
@@ -94,10 +98,22 @@ def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[Transcr
     )
 
     while True:
-        requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in stream_generator)
-        responses = client.streaming_recognize(streaming_config, requests)
+        # Drain stale audio before (re)connecting
+        if audio_queue is not None:
+            drained = 0
+            while not audio_queue.empty():
+                try:
+                    audio_queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+            if drained:
+                logger.debug("Drained {} stale audio chunks", drained)
 
         try:
+            requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in stream_generator)
+            responses = client.streaming_recognize(streaming_config, requests)
+
             for response in responses:
                 if not response.results:
                     continue
@@ -108,8 +124,11 @@ def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[Transcr
                     text=result.alternatives[0].transcript,
                     is_final=result.is_final,
                 )
-        except OutOfRange:
-            logger.warning("STT timeout, reconnecting...")
+        except GoogleAPICallError as e:
+            logger.warning("STT stream error ({}), reconnecting...", e.__class__.__name__)
+            continue
+        except Exception as e:
+            logger.warning("STT unexpected error ({}), reconnecting...", e)
             continue
         else:
             break

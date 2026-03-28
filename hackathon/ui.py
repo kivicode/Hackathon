@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Silence noisy gRPC/protobuf loggers
+logging.getLogger("grpc").setLevel(logging.ERROR)
+logging.getLogger("google").setLevel(logging.WARNING)
 
 from loguru import logger
 from textual.app import App, ComposeResult
 from textual.containers import Container
 from textual.widgets import Label, RichLog, Static
 
-from hackathon.agent import MeetingAgent, TranscriptChunk
+from hackathon.agent import SOURCES, MeetingAgent, TranscriptChunk
 from hackathon.audio import MicrophoneInput
 from hackathon.config import ProjectSettings
 from hackathon.interrupt_service import InterruptService
@@ -95,6 +100,9 @@ Screen {
 
 class MeetingUI(App):
     CSS = APP_CSS
+    BINDINGS = [("space", "open_source", "Open source")]
+
+    _pending_source_url: str = ""
 
     def compose(self) -> ComposeResult:
         yield Static(BANNER, id="banner")
@@ -116,15 +124,33 @@ class MeetingUI(App):
         self.query_one("#interim", Static).update("")
         self.query_one("#transcript-log", RichLog).write(f"[dim]{ts}[/dim]  {text}")
 
-    def show_alert(self, text: str) -> None:
+    def show_alert(self, text: str, source_key: str = "") -> None:
         container = self.query_one("#alert-container")
         label = self.query_one("#alert-box", Label)
-        label.update(f"  CORRECTION: {text}")
+
+        source = SOURCES.get(source_key, {})
+        url = source.get("url", "")
+        alias = source.get("alias", "")
+
+        msg = f"  CORRECTION: {text}"
+        if url and alias:
+            msg += f"\n\n  Press SPACE to open the {alias}"
+            self._pending_source_url = url
+        else:
+            self._pending_source_url = ""
+
+        label.update(msg)
         container.add_class("visible")
-        self.set_timer(10, self._hide_alert)
+        self.set_timer(15, self._hide_alert)
 
     def _hide_alert(self) -> None:
         self.query_one("#alert-container").remove_class("visible")
+        self._pending_source_url = ""
+
+    def action_open_source(self) -> None:
+        if self._pending_source_url:
+            import webbrowser
+            webbrowser.open(self._pending_source_url)
 
     def set_turn_indicator(self, state: str) -> None:
         indicator = self.query_one("#turn-indicator", Static)
@@ -148,7 +174,7 @@ class MeetingUI(App):
 
         # -- TTS --
         tts_client = create_client(settings)
-        audio_out = open_stream(settings.audio_device, settings.sample_rate)
+        audio_out = await asyncio.to_thread(open_stream, settings.audio_device, settings.sample_rate)
 
         # -- Shared mic (single source for both STT and turn detector) --
         mic_input = MicrophoneInput(sample_rate_hz=16000)
@@ -163,18 +189,24 @@ class MeetingUI(App):
         async def _mic_to_stt_bridge() -> None:
             """Forward mic audio chunks to the sync STT queue."""
             async for chunk in mic_input.subscribe():
-                audio_queue.put(chunk.pcm_s16le)
-            audio_queue.put(None)
+                audio_queue.put_nowait(chunk.pcm_s16le)
+            audio_queue.put_nowait(None)
 
         bridge_task = asyncio.create_task(_mic_to_stt_bridge())
 
         # -- VAD indicator: uses TurnDetector to show speech/silence --
         vad_detector = TurnDetector(sample_rate_hz=mic_input.sample_rate_hz)
+        _vad_frame_count = 0
 
         async def _vad_monitor() -> None:
+            nonlocal _vad_frame_count
             last_state = ""
             async for chunk in mic_input.subscribe():
-                vad_detector.feed(chunk)
+                _vad_frame_count += 1
+                # Only run VAD every 5th frame (~100ms) to reduce CPU load
+                if _vad_frame_count % 5 != 0:
+                    continue
+                await asyncio.to_thread(vad_detector.feed, chunk)
                 state = "speech" if vad_detector._last_frame_was_speech else "silence"
                 if state != last_state:
                     last_state = state
@@ -218,7 +250,7 @@ class MeetingUI(App):
 
         def _stt_worker() -> None:
             try:
-                for event in generate_transcripts(_audio_generator()):
+                for event in generate_transcripts(_audio_generator(), audio_queue=audio_queue):
                     if event.is_final:
                         chunk = TranscriptChunk(
                             speaker="Speaker",
@@ -246,24 +278,32 @@ class MeetingUI(App):
                     continue
                 self.set_status("Analyzing...")
                 try:
-                    correction = await agent.process_chunk(chunk)
+                    result = await agent.process_chunk(chunk)
                 except Exception:
                     logger.exception("Agent error")
                     self.set_status("Listening...")
                     continue
-                if correction:
-                    self.show_alert(correction)
-                    self.set_turn_indicator("waiting")
-                    self.set_status("Waiting for pause...")
+                if result:
+                    if settings.eager_alert:
+                        self.show_alert(result.correction, result.source_key)
+
+                    self.set_status("Generating speech...")
                     try:
-                        await interrupt_svc.wait_for_interrupt_window()
-                    except Exception:
-                        logger.warning("Turn detector error, speaking immediately")
-                    self.set_turn_indicator("speaking")
-                    self.set_status("Speaking correction...")
-                    try:
-                        async for audio_chunk in text_to_speech_stream(tts_client, correction, settings):
-                            write_chunk(audio_out, audio_chunk)
+                        first_chunk = True
+                        async for audio_chunk in text_to_speech_stream(tts_client, result.correction, settings):
+                            if first_chunk:
+                                first_chunk = False
+                                if not settings.eager_alert:
+                                    self.show_alert(result.correction, result.source_key)
+                                self.set_turn_indicator("waiting")
+                                self.set_status("Waiting for pause...")
+                                try:
+                                    await interrupt_svc.wait_for_interrupt_window()
+                                except Exception:
+                                    logger.warning("Turn detector error, speaking immediately")
+                                self.set_turn_indicator("speaking")
+                                self.set_status("Speaking correction...")
+                            await asyncio.to_thread(write_chunk, audio_out, audio_chunk)
                     except Exception:
                         logger.exception("TTS error")
                     self.set_turn_indicator("")
@@ -273,8 +313,8 @@ class MeetingUI(App):
             bridge_task.cancel()
             await interrupt_svc.stop()
             await mic_input.stop()
-            audio_out.stop()
-            audio_out.close()
+            await asyncio.to_thread(audio_out.stop)
+            await asyncio.to_thread(audio_out.close)
 
 
 if __name__ == "__main__":
