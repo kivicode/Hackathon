@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
@@ -16,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings = ProjectSettings()
     app.state.agent = MeetingAgent(
         settings=settings,
@@ -30,9 +31,9 @@ app = FastAPI(title="Meeting Fact-Check Agent", lifespan=lifespan)
 
 
 @app.websocket("/ws/transcription")
-async def transcription_ws(websocket: WebSocket):
+async def transcription_ws(websocket: WebSocket) -> None:
     await websocket.accept()
-    agent: MeetingAgent = app.state.agent
+    agent: MeetingAgent = websocket.app.state.agent
     try:
         while True:
             data = await websocket.receive_json()
@@ -45,11 +46,11 @@ async def transcription_ws(websocket: WebSocket):
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/api/transcript")
-async def get_transcript():
+async def get_transcript() -> list[dict]:
     agent: MeetingAgent = app.state.agent
     return [c.model_dump() for c in agent.transcript]

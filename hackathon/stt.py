@@ -1,20 +1,24 @@
+"""Speech-to-text via Google Cloud Speech API."""
+
+from __future__ import annotations
+
 import queue
+from collections.abc import Generator, Iterator
 
 import pyaudio
 from google.cloud import speech
 
-# Audio recording parameters
 RATE = 16000
 CHUNK = int(RATE / 10)  # 100ms chunks
 
 
 class ResumableMicrophoneStream:
-    """Opens a recording stream as a generator yielding the audio chunks."""
+    """Opens a recording stream as a generator yielding audio chunks."""
 
-    def __init__(self, rate, chunk):
+    def __init__(self, rate: int = RATE, chunk_size: int = CHUNK) -> None:
         self._rate = rate
-        self._chunk = chunk
-        self._buff = queue.Queue()
+        self._chunk = chunk_size
+        self._buff: queue.Queue[bytes | None] = queue.Queue()
         self.closed = True
         self._audio_interface = pyaudio.PyAudio()
         self._audio_stream = self._audio_interface.open(
@@ -27,21 +31,25 @@ class ResumableMicrophoneStream:
         )
         self.closed = False
 
-    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+    def _fill_buffer(
+        self,
+        in_data: bytes | None,
+        frame_count: int,  # noqa: ARG002
+        time_info: dict,  # noqa: ARG002
+        status_flags: int,  # noqa: ARG002
+    ) -> tuple[None, int]:
         """Continuously collect data from the audio stream into the buffer."""
         self._buff.put(in_data)
         return None, pyaudio.paContinue
 
-    def generator(self):
-        """Yields audio chunks from the buffer."""
+    def generator(self) -> Generator[bytes]:
+        """Yield audio chunks from the buffer."""
         while not self.closed:
-            # Use a blocking get with a timeout
             chunk = self._buff.get()
             if chunk is None:
                 return
             data = [chunk]
 
-            # Consume whatever other data is in the queue
             while True:
                 try:
                     chunk = self._buff.get(block=False)
@@ -53,7 +61,7 @@ class ResumableMicrophoneStream:
 
             yield b"".join(data)
 
-    def close(self):
+    def close(self) -> None:
         self.closed = True
         self._buff.put(None)
         self._audio_stream.stop_stream()
@@ -61,11 +69,8 @@ class ResumableMicrophoneStream:
         self._audio_interface.terminate()
 
 
-def generate_transcripts(stream_generator):
-    """
-    Consumes the Google API responses and yields finalized text.
-    Your main app can loop over this function.
-    """
+def generate_transcripts(stream_generator: Iterator[bytes]) -> Generator[str]:
+    """Consume Google Speech API responses and yield finalized transcript text."""
     client = speech.SpeechClient()
 
     config = speech.RecognitionConfig(
@@ -77,12 +82,10 @@ def generate_transcripts(stream_generator):
 
     streaming_config = speech.StreamingRecognitionConfig(
         config=config,
-        interim_results=True,  # Set to False if you only want finalized sentences
+        interim_results=True,
     )
 
-    # Convert our local audio generator into Google API requests
     requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in stream_generator)
-
     responses = client.streaming_recognize(streaming_config, requests)
 
     for response in responses:
@@ -93,29 +96,18 @@ def generate_transcripts(stream_generator):
         if not result.alternatives:
             continue
 
-        transcript = result.alternatives[0].transcript
-
-        # We only yield the finalized sentence to avoid spamming the rest of your app
-        # with partial "interim" guesses as the person is speaking.
         if result.is_final:
-            yield transcript
+            yield result.alternatives[0].transcript
 
 
-# --- How the rest of your app uses this ---
 if __name__ == "__main__":
-    print("Starting audio stream... (Press Ctrl+C to stop)")
+    print("Starting audio stream... (Press Ctrl+C to stop)")  # noqa: T201
     mic_stream = ResumableMicrophoneStream(RATE, CHUNK)
 
     try:
-        # This creates the stream of text your app needs
-        transcript_stream = generate_transcripts(mic_stream.generator())
-
-        # The other part of your app can iterate over this stream like so:
-        for final_sentence in transcript_stream:
-            print(f"App Received: {final_sentence}")
-            # Here is where you would save to a database, send to an LLM, etc.
-
+        for final_sentence in generate_transcripts(mic_stream.generator()):
+            print(f"Received: {final_sentence}")  # noqa: T201
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\nStopping...")  # noqa: T201
     finally:
         mic_stream.close()

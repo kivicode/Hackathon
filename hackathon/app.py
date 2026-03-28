@@ -1,5 +1,10 @@
+"""Voiceover HTTP endpoint — speaks text via TTS to the virtual audio device."""
+
+from __future__ import annotations
+
 import asyncio
 from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI
 from google import genai
@@ -19,7 +24,7 @@ client: genai.Client
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     global client  # noqa: PLW0603
     client = create_client(settings)
     yield
@@ -29,7 +34,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/speak")
-async def speak(request: SpeakRequest) -> dict:
+async def speak(request: SpeakRequest) -> dict[str, str]:
     stream = await asyncio.to_thread(open_stream, settings.audio_device, settings.sample_rate)
     try:
         async for chunk in text_to_speech_stream(client, request.text, settings):

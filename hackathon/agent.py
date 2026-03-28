@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import logging
 from collections import deque
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from google import genai
 from google.genai import types
@@ -100,13 +101,16 @@ Compose the correction:"""
 # MeetingAgent
 # ---------------------------------------------------------------------------
 
+RagFn = Callable[[str, str], list[Evidence]]
+DeliveryFn = Callable[[str], None]
+
 
 class MeetingAgent:
     def __init__(
         self,
         settings: ProjectSettings,
-        rag_fn: Callable[[str, str], list[Evidence]],
-        delivery_fn: Callable[[str], None],
+        rag_fn: RagFn,
+        delivery_fn: DeliveryFn,
     ) -> None:
         self.client = genai.Client(api_key=settings.gemini_api_key)
         self.model = settings.gemini_model
@@ -129,7 +133,7 @@ class MeetingAgent:
             if not evidence:
                 continue
 
-            contradiction = await self._check_contradiction(claim, evidence, context)
+            contradiction = await self._check_contradiction(claim, evidence)
             if not contradiction.is_contradicted:
                 continue
             if contradiction.confidence < self.confidence_threshold:
@@ -169,7 +173,6 @@ class MeetingAgent:
         self,
         claim: Claim,
         evidence: list[Evidence],
-        context: str,
     ) -> ContradictionResult:
         evidence_text = "\n".join(f"[{e.source}] {e.snippet}" for e in evidence)
         prompt = CONTRADICTION_PROMPT.format(
