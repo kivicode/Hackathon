@@ -93,6 +93,4 @@ docstring-code-format = true
 docstring-code-line-length = 120
 
 [dependency-groups]
-dev = [
-    "ruff>=0.15.8",
-]
+dev = ["ruff>=0.15.8"]
