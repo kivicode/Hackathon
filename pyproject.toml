@@ -8,6 +8,7 @@ dependencies = [
     "fastapi[standard]>=0.135.2",
     "google-genai>=1.68.0",
     "pydantic-settings>=2.13.1",
+    "webrtcvad-wheels>=2.0.14",
 ]
 
 
