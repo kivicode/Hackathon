@@ -22,18 +22,23 @@ from hackathon.agent import SOURCES, MeetingAgent, TranscriptChunk
 from hackathon.audio import MicrophoneInput
 from hackathon.config import ProjectSettings
 from hackathon.interrupt_service import InterruptService
-from hackathon.turn_detector import TurnDetector
 from hackathon.rag.light import LightRAGBackend
 from hackathon.rag.stuffing import StuffingRAG
 from hackathon.stt import generate_transcripts  # noqa: F401
+from hackathon.turn_detector import TurnDetector
 from hackathon.voiceover.audio import open_stream, write_chunk
 from hackathon.voiceover.tts import TTSSession, create_client, text_to_speech_stream
 
 BANNER = r"""
-  __ _  ___ ___| |_   ___| |__   ___  ___| | __
- / _` |/ _ | __| __| / __| '_ \ / _ \/ __| |/ /
-| |_| |  __| |_| |_ | (__| | | |  __| (__|   <
- \__,_|\___|\__|\__| \___|_| |_|\___|\___|_|\_\
+   ░███               ░██                  ░██                              ░██ ░██
+  ░██░██              ░██                  ░██                              ░██ ░██
+ ░██  ░██   ░███████  ░██    ░██ ░███████  ░████████  ░██    ░██  ░██████   ░██ ░██ ░██    ░██
+░█████████ ░██    ░██ ░██   ░██ ░██        ░██    ░██ ░██    ░██       ░██  ░██ ░██ ░██    ░██
+░██    ░██ ░██        ░███████   ░███████  ░██    ░██ ░██    ░██  ░███████  ░██ ░██ ░██    ░██
+░██    ░██ ░██    ░██ ░██   ░██        ░██ ░██    ░██ ░██   ░███ ░██   ░██  ░██ ░██ ░██   ░███
+░██    ░██  ░███████  ░██    ░██ ░███████  ░██    ░██  ░█████░██  ░█████░██ ░██ ░██  ░█████░██
+                                                                                           ░██
+                                                                                     ░███████
 """
 
 APP_CSS = """
@@ -42,7 +47,7 @@ Screen {
 }
 
 #banner {
-    height: 6;
+    height: 11;
     content-align: center middle;
     color: $text-muted;
     text-style: bold;
@@ -150,6 +155,7 @@ class MeetingUI(App):
     def action_open_source(self) -> None:
         if self._pending_source_url:
             import webbrowser
+
             webbrowser.open(self._pending_source_url)
 
     def set_turn_indicator(self, state: str) -> None:
@@ -276,7 +282,10 @@ class MeetingUI(App):
                 try:
                     first_chunk = True
                     async for audio_chunk in text_to_speech_stream(
-                        tts_client, result.correction, settings, session=tts_session,
+                        tts_client,
+                        result.correction,
+                        settings,
+                        session=tts_session,
                     ):
                         if first_chunk:
                             first_chunk = False

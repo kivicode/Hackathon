@@ -17,29 +17,42 @@ os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "0"
 
 from loguru import logger
 
-# Suppress noisy PortAudio/gRPC stream interruption warnings
+# Suppress noisy shutdown warnings
 warnings.filterwarnings("ignore", message=".*Exception ignored.*")
+warnings.filterwarnings("ignore", message=".*error occurred during closing.*")
+warnings.filterwarnings("ignore", message=".*already running.*")
 
 
 def _install_exception_hooks() -> None:
-    """Suppress harmless 'exception in stream callback' noise."""
+    """Suppress harmless shutdown noise."""
     _original_excepthook = sys.excepthook
     _original_threading_excepthook = threading.excepthook
 
+    _suppress = {"stream", "portaudio", "callback", "event loop is closed", "already running", "aclose"}
+
     def _quiet_excepthook(exc_type, exc_value, exc_tb):  # noqa: ANN001
         msg = str(exc_value).lower()
-        if "stream" in msg or "portaudio" in msg or "callback" in msg:
+        if any(s in msg for s in _suppress):
             return
         _original_excepthook(exc_type, exc_value, exc_tb)
 
     def _quiet_threading_excepthook(args):  # noqa: ANN001
         msg = str(args.exc_value).lower()
-        if "stream" in msg or "portaudio" in msg or "callback" in msg:
+        if any(s in msg for s in _suppress):
             return
         _original_threading_excepthook(args)
 
     sys.excepthook = _quiet_excepthook
     threading.excepthook = _quiet_threading_excepthook
+
+    # Suppress async generator cleanup errors
+    def _quiet_asyncgen_finalizer(agen):  # noqa: ANN001
+        try:
+            agen.aclose()
+        except RuntimeError:
+            pass
+
+    sys.set_asyncgen_hooks(finalizer=_quiet_asyncgen_finalizer)
 
 
 _install_exception_hooks()
