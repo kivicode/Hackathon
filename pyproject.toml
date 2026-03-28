@@ -8,6 +8,8 @@ dependencies = [
     "fastapi[standard]>=0.135.2",
     "google-genai>=1.68.0",
     "pydantic-settings>=2.13.1",
+    "sounddevice>=0.5.0",
+    "numpy>=2.0.0",
 ]
 
 
