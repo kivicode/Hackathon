@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import queue
+import time as _time
 from collections.abc import Generator, Iterator
 
 import pyaudio
+from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import speech
 from loguru import logger
 from pydantic import BaseModel
@@ -72,17 +74,39 @@ class ResumableMicrophoneStream:
         self._audio_interface.terminate()
 
 
+def _drain_queue(audio_queue: queue.Queue) -> None:
+    """Drain stale audio from the queue."""
+    drained = 0
+    while not audio_queue.empty():
+        try:
+            audio_queue.get_nowait()
+            drained += 1
+        except queue.Empty:
+            break
+    if drained:
+        logger.debug("Drained {} stale audio chunks", drained)
+
+
+def _make_audio_gen(audio_queue: queue.Queue) -> Generator[bytes]:
+    """Create a fresh generator that reads from the audio queue."""
+    while True:
+        try:
+            data = audio_queue.get(timeout=30)
+        except queue.Empty:
+            return
+        if data is None:
+            return
+        yield data
+
+
 def generate_transcripts(
-    stream_generator: Iterator[bytes],
-    audio_queue: queue.Queue | None = None,
+    audio_queue: queue.Queue,
 ) -> Generator[TranscriptEvent]:
     """Consume Google Speech API responses and yield transcript events.
 
-    Auto-reconnects on timeout/stream errors. If audio_queue is provided,
-    drains stale data before reconnecting.
+    Creates a fresh audio generator on each reconnect so the gRPC stream
+    always gets a clean iterator.
     """
-    from google.api_core.exceptions import GoogleAPICallError
-
     client = speech.SpeechClient()
 
     config = speech.RecognitionConfig(
@@ -97,21 +121,13 @@ def generate_transcripts(
         interim_results=True,
     )
 
+    consecutive_errors = 0
     while True:
-        # Drain stale audio before (re)connecting
-        if audio_queue is not None:
-            drained = 0
-            while not audio_queue.empty():
-                try:
-                    audio_queue.get_nowait()
-                    drained += 1
-                except queue.Empty:
-                    break
-            if drained:
-                logger.debug("Drained {} stale audio chunks", drained)
+        _drain_queue(audio_queue)
+        audio_gen = _make_audio_gen(audio_queue)
 
         try:
-            requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in stream_generator)
+            requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in audio_gen)
             responses = client.streaming_recognize(streaming_config, requests)
 
             for response in responses:
@@ -120,25 +136,47 @@ def generate_transcripts(
                 result = response.results[0]
                 if not result.alternatives:
                     continue
+                consecutive_errors = 0
                 yield TranscriptEvent(
                     text=result.alternatives[0].transcript,
                     is_final=result.is_final,
                 )
         except GoogleAPICallError as e:
-            logger.warning("STT stream error ({}), reconnecting...", e.__class__.__name__)
-            continue
+            consecutive_errors += 1
+            if consecutive_errors > 5:
+                logger.warning("STT: too many errors, backing off 2s...")
+                _time.sleep(2)
+                consecutive_errors = 0
+            else:
+                logger.warning("STT stream error ({}), reconnecting...", e.__class__.__name__)
         except Exception as e:
-            logger.warning("STT unexpected error ({}), reconnecting...", e)
-            continue
-        else:
-            break
+            if "shutdown" in str(e).lower() or "interpreter" in str(e).lower():
+                break
+            consecutive_errors += 1
+            if consecutive_errors > 5:
+                logger.warning("STT: too many errors, backing off 2s...")
+                _time.sleep(2)
+                consecutive_errors = 0
+            else:
+                logger.warning("STT unexpected error ({}), reconnecting...", e)
 
 
 if __name__ == "__main__":
     logger.info("Starting audio stream... (Press Ctrl+C to stop)")
     mic_stream = ResumableMicrophoneStream(RATE, CHUNK)
+    q: queue.Queue[bytes | None] = queue.Queue()
+
+    import threading
+
+    def _feed() -> None:
+        for chunk in mic_stream.generator():
+            q.put(chunk)
+        q.put(None)
+
+    threading.Thread(target=_feed, daemon=True).start()
+
     try:
-        for event in generate_transcripts(mic_stream.generator()):
+        for event in generate_transcripts(q):
             if event.is_final:
                 logger.info("[FINAL] {}", event.text)
             else:

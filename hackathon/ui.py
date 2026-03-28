@@ -25,9 +25,9 @@ from hackathon.interrupt_service import InterruptService
 from hackathon.turn_detector import TurnDetector
 from hackathon.rag.light import LightRAGBackend
 from hackathon.rag.stuffing import StuffingRAG
-from hackathon.stt import generate_transcripts
+from hackathon.stt import generate_transcripts  # noqa: F401
 from hackathon.voiceover.audio import open_stream, write_chunk
-from hackathon.voiceover.tts import create_client, text_to_speech_stream
+from hackathon.voiceover.tts import TTSSession, create_client, text_to_speech_stream
 
 BANNER = r"""
   __ _  ___ ___| |_   ___| |__   ___  ___| | __
@@ -174,10 +174,11 @@ class MeetingUI(App):
 
         # -- TTS --
         tts_client = create_client(settings)
+        tts_session = TTSSession(tts_client, settings)
         audio_out = await asyncio.to_thread(open_stream, settings.audio_device, settings.sample_rate)
 
         # -- Shared mic (single source for both STT and turn detector) --
-        mic_input = MicrophoneInput(sample_rate_hz=16000)
+        mic_input = MicrophoneInput(sample_rate_hz=16000, queue_size=settings.microphone_queue_size)
         await mic_input.start()
 
         interrupt_svc = InterruptService(mic_input)
@@ -214,14 +215,6 @@ class MeetingUI(App):
 
         vad_task = asyncio.create_task(_vad_monitor())
 
-        def _audio_generator():
-            """Sync generator that reads from the audio queue."""
-            while True:
-                data = audio_queue.get()
-                if data is None:
-                    return
-                yield data
-
         # -- Agent + RAG --
         knowledge = ""
         rag = None
@@ -240,6 +233,7 @@ class MeetingUI(App):
                 rag = rag_backend
 
         agent = MeetingAgent(settings=settings, knowledge_base=knowledge, rag=rag)
+        await agent.connect()
         self.set_status("Listening...")
 
         # -- STT in background thread (reads from shared mic via bridge) --
@@ -250,7 +244,7 @@ class MeetingUI(App):
 
         def _stt_worker() -> None:
             try:
-                for event in generate_transcripts(_audio_generator(), audio_queue=audio_queue):
+                for event in generate_transcripts(audio_queue):
                     if event.is_final:
                         chunk = TranscriptChunk(
                             speaker="Speaker",
@@ -268,7 +262,55 @@ class MeetingUI(App):
 
         loop.run_in_executor(None, _stt_worker)
 
+        # -- Correction delivery (serialized so audio doesn't overlap) --
+        correction_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _deliver_corrections() -> None:
+            while True:
+                result = await correction_queue.get()
+                if result is None:
+                    break
+                if settings.eager_alert:
+                    self.show_alert(result.correction, result.source_key)
+                self.set_status("Generating speech...")
+                try:
+                    first_chunk = True
+                    async for audio_chunk in text_to_speech_stream(
+                        tts_client, result.correction, settings, session=tts_session,
+                    ):
+                        if first_chunk:
+                            first_chunk = False
+                            if not settings.eager_alert:
+                                self.show_alert(result.correction, result.source_key)
+                            if settings.use_turn_detector:
+                                self.set_turn_indicator("waiting")
+                                self.set_status("Waiting for pause...")
+                                try:
+                                    await interrupt_svc.wait_for_interrupt_window()
+                                except Exception:
+                                    logger.warning("Turn detector error, speaking immediately")
+                            self.set_turn_indicator("speaking")
+                            self.set_status("Speaking correction...")
+                        await asyncio.to_thread(write_chunk, audio_out, audio_chunk)
+                except Exception:
+                    logger.exception("TTS error")
+                self.set_turn_indicator("")
+                self.set_status("Listening...")
+
+        delivery_task = asyncio.create_task(_deliver_corrections())
+
+        # -- Agent analysis (runs concurrently, doesn't block chunk consumption) --
+        async def _analyze(chunk: TranscriptChunk) -> None:
+            try:
+                result = await agent.process_chunk(chunk)
+            except Exception:
+                logger.exception("Agent error")
+                return
+            if result:
+                await correction_queue.put(result)
+
         # -- Main loop --
+        analysis_tasks: set[asyncio.Task] = set()
         try:
             while True:
                 chunk = await transcript_queue.get()
@@ -277,40 +319,18 @@ class MeetingUI(App):
                 if not chunk.text.strip():
                     continue
                 self.set_status("Analyzing...")
-                try:
-                    result = await agent.process_chunk(chunk)
-                except Exception:
-                    logger.exception("Agent error")
-                    self.set_status("Listening...")
-                    continue
-                if result:
-                    if settings.eager_alert:
-                        self.show_alert(result.correction, result.source_key)
-
-                    self.set_status("Generating speech...")
-                    try:
-                        first_chunk = True
-                        async for audio_chunk in text_to_speech_stream(tts_client, result.correction, settings):
-                            if first_chunk:
-                                first_chunk = False
-                                if not settings.eager_alert:
-                                    self.show_alert(result.correction, result.source_key)
-                                self.set_turn_indicator("waiting")
-                                self.set_status("Waiting for pause...")
-                                try:
-                                    await interrupt_svc.wait_for_interrupt_window()
-                                except Exception:
-                                    logger.warning("Turn detector error, speaking immediately")
-                                self.set_turn_indicator("speaking")
-                                self.set_status("Speaking correction...")
-                            await asyncio.to_thread(write_chunk, audio_out, audio_chunk)
-                    except Exception:
-                        logger.exception("TTS error")
-                    self.set_turn_indicator("")
-                self.set_status("Listening...")
+                task = asyncio.create_task(_analyze(chunk))
+                analysis_tasks.add(task)
+                task.add_done_callback(analysis_tasks.discard)
         finally:
+            await correction_queue.put(None)
+            await delivery_task
+            for t in analysis_tasks:
+                t.cancel()
             vad_task.cancel()
             bridge_task.cancel()
+            await tts_session.close()
+            await agent.close()
             await interrupt_svc.stop()
             await mic_input.stop()
             await asyncio.to_thread(audio_out.stop)

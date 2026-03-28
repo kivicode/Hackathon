@@ -32,7 +32,7 @@ class AgentResponse(BaseModel):
     should_intervene: bool
     correction: str = ""
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    source_key: str = ""  # key into SOURCES dict, e.g. "financial_report"
+    source_key: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -79,26 +79,14 @@ CRITICAL rules:
 - Start with: "Small correction:", "Worth noting:", or "Caution:"
 - Set source_key to the most relevant source key from the list above (e.g. "financial_report").
 - NEVER repeat a correction you already made, even if the speaker repeats the claim or a different \
-  speaker agrees with it. Once corrected, the topic is DONE. The list of past corrections and their \
-  topics is provided below — if the new statement is about the same topic, do NOT intervene.
+  speaker agrees with it. Once corrected, the topic is DONE.
 
 Respond with JSON: should_intervene (bool), correction (string), confidence (0.0-1.0), source_key (string).
-If no intervention needed, return should_intervene=false with empty correction and source_key."""
-
-CHUNK_PROMPT = """\
-Meeting transcript so far:
-{context}
-
-Corrections you have already made (do NOT repeat these):
-{past_corrections}
-
-Latest statement ({speaker}): {text}
-
-Should you intervene? Return JSON."""
+If no intervention needed, return {{"should_intervene": false}}."""
 
 
 # ---------------------------------------------------------------------------
-# MeetingAgent
+# MeetingAgent — uses async chat to keep session alive
 # ---------------------------------------------------------------------------
 
 
@@ -118,53 +106,58 @@ class MeetingAgent:
             source_keys=", ".join(SOURCES.keys()),
         )
         self._rag = rag
-        self._past_corrections: list[str] = []
+        self._chat = None
 
-    async def process_chunk(self, chunk: TranscriptChunk) -> AgentResponse | None:
-        """Process a transcript chunk. Returns AgentResponse if intervention needed."""
-        self.transcript.append(chunk)
-
-        past = "\n".join(f"- {c}" for c in self._past_corrections) if self._past_corrections else "(none)"
-
-        # Optionally enrich system prompt with RAG results
-        system = self._system
-        if self._rag:
-            try:
-                rag_context = await self._rag.query(chunk.text)
-                system = system + f"\n\nAdditional context from RAG:\n{rag_context}"
-            except Exception:
-                logger.exception("RAG query failed")
-
-        prompt = CHUNK_PROMPT.format(
-            context=self._build_context(),
-            past_corrections=past,
-            speaker=chunk.speaker,
-            text=chunk.text,
-        )
-
-        logger.debug("Sending chunk: speaker={} text='{}'", chunk.speaker, chunk.text[:80])
-        t0 = time.monotonic()
-
-        response = await self.client.aio.models.generate_content(
+    async def connect(self) -> None:
+        """Create a persistent chat session with the system prompt baked in."""
+        self._chat = self.client.aio.chats.create(
             model=self.model,
-            contents=[
-                types.Content(role="user", parts=[types.Part(text=system)]),
-                types.Content(role="user", parts=[types.Part(text=prompt)]),
-            ],
             config=types.GenerateContentConfig(
+                system_instruction=self._system,
                 response_mime_type="application/json",
                 response_schema=AgentResponse,
                 temperature=0.1,
             ),
         )
+        logger.debug("Chat session created")
+
+    async def close(self) -> None:
+        """Release the chat session."""
+        self._chat = None
+
+    async def process_chunk(self, chunk: TranscriptChunk) -> AgentResponse | None:
+        """Process a transcript chunk via the persistent chat session."""
+        self.transcript.append(chunk)
+
+        if len(chunk.text.strip()) < 10:
+            return None
+
+        if self._chat is None:
+            await self.connect()
+
+        prompt = f"[{chunk.speaker}]: {chunk.text}"
+
+        logger.debug("Sending: {}", prompt[:80])
+        t0 = time.monotonic()
+
+        try:
+            response = await self._chat.send_message(prompt)
+        except Exception:
+            logger.warning("Chat error, recreating session...")
+            await self.connect()
+            try:
+                response = await self._chat.send_message(prompt)
+            except Exception:
+                logger.exception("Chat retry failed")
+                return None
 
         elapsed = time.monotonic() - t0
-        logger.debug("Agent response in {:.1f}s: {}", elapsed, response.text)
+        logger.debug("Response in {:.1f}s: {}", elapsed, response.text)
 
         try:
             result = AgentResponse(**json.loads(response.text))
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Failed to parse agent response: {}", response.text)
+            logger.warning("Failed to parse: {}", response.text)
             return None
 
         logger.info(
@@ -176,9 +169,6 @@ class MeetingAgent:
         )
 
         if result.should_intervene and result.confidence >= self.confidence_threshold:
-            self._past_corrections.append(
-                f"[{chunk.speaker}: \"{chunk.text}\"] → {result.correction}"
-            )
             return result
 
         return None
@@ -193,7 +183,6 @@ class MeetingAgent:
 
 if __name__ == "__main__":
     import asyncio
-
     from pathlib import Path
 
     from hackathon.config import ProjectSettings
@@ -218,6 +207,7 @@ if __name__ == "__main__":
         data_dir = Path(settings.rag_data_dir)
         knowledge = "\n\n".join(f"=== {p.name} ===\n{p.read_text()}" for p in sorted(data_dir.glob("*.md")))
         agent = MeetingAgent(settings=settings, knowledge_base=knowledge)
+        await agent.connect()
         logger.info("Knowledge base: {} chars", len(knowledge))
 
         for speaker, text in DEMO_TRANSCRIPT:

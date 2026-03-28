@@ -54,7 +54,7 @@ def _run_headless() -> None:
     from hackathon.interrupt_service import InterruptService
     from hackathon.stt import generate_transcripts
     from hackathon.voiceover.audio import open_stream, write_chunk
-    from hackathon.voiceover.tts import create_client, text_to_speech_stream
+    from hackathon.voiceover.tts import TTSSession, create_client, text_to_speech_stream
 
     logger.remove()
     logger.add(sys.stderr, level="INFO", format="{time:HH:mm:ss} | {level:<7} | {message}")
@@ -64,10 +64,11 @@ def _run_headless() -> None:
         loop = asyncio.get_event_loop()
 
         tts_client = create_client(settings)
+        tts_session = TTSSession(tts_client, settings)
         audio_out = open_stream(settings.audio_device, settings.sample_rate)
 
         # -- Shared mic --
-        mic_input = MicrophoneInput(sample_rate_hz=16000)
+        mic_input = MicrophoneInput(sample_rate_hz=16000, queue_size=settings.microphone_queue_size)
         await mic_input.start()
         interrupt_svc = InterruptService(mic_input)
         await interrupt_svc.start()
@@ -82,13 +83,6 @@ def _run_headless() -> None:
 
         bridge_task = asyncio.create_task(_mic_bridge())
 
-        def _audio_gen():
-            while True:
-                data = audio_queue.get()
-                if data is None:
-                    return
-                yield data
-
         # -- Knowledge --
         knowledge = ""
         if settings.use_rag:
@@ -97,6 +91,7 @@ def _run_headless() -> None:
             knowledge = "\n\n---\n\n".join(f"# {k}\n{v}" for k, v in docs.items())
 
         agent = MeetingAgent(settings=settings, knowledge_base=knowledge)
+        await agent.connect()
         logger.info("Pipeline running (headless). Speak into the mic...")
 
         # -- STT thread --
@@ -107,7 +102,7 @@ def _run_headless() -> None:
 
         def _stt_worker() -> None:
             try:
-                for event in generate_transcripts(_audio_gen(), audio_queue=audio_queue):
+                for event in generate_transcripts(audio_queue):
                     if event.is_final:
                         _put(TranscriptChunk(speaker="Speaker", text=event.text, timestamp=time.time()))
                         logger.info("STT: {}", event.text.strip())
@@ -120,7 +115,49 @@ def _run_headless() -> None:
 
         loop.run_in_executor(None, _stt_worker)
 
+        # -- Correction delivery --
+        correction_queue: asyncio.Queue = asyncio.Queue()
+
+        async def _deliver() -> None:
+            while True:
+                result = await correction_queue.get()
+                if result is None:
+                    break
+                logger.success("Correction: {}", result.correction)
+                src = SOURCES.get(result.source_key, {})
+                if src.get("url"):
+                    logger.info("Source: {} — {}", src["alias"], src["url"])
+                logger.info("Generating speech...")
+                try:
+                    first_chunk = True
+                    async for audio_chunk in text_to_speech_stream(
+                        tts_client, result.correction, settings, session=tts_session,
+                    ):
+                        if first_chunk:
+                            first_chunk = False
+                            if settings.use_turn_detector:
+                                try:
+                                    await interrupt_svc.wait_for_interrupt_window()
+                                except Exception:
+                                    logger.warning("Turn detector error, speaking immediately")
+                            logger.info("Speaking...")
+                        write_chunk(audio_out, audio_chunk)
+                except Exception:
+                    logger.exception("TTS error")
+
+        delivery_task = asyncio.create_task(_deliver())
+
+        async def _analyze(chunk: TranscriptChunk) -> None:
+            try:
+                result = await agent.process_chunk(chunk)
+            except Exception:
+                logger.exception("Agent error")
+                return
+            if result:
+                await correction_queue.put(result)
+
         # -- Main loop --
+        analysis_tasks: set[asyncio.Task] = set()
         try:
             while True:
                 chunk = await transcript_queue.get()
@@ -128,35 +165,19 @@ def _run_headless() -> None:
                     break
                 if not chunk.text.strip():
                     continue
-                try:
-                    result = await agent.process_chunk(chunk)
-                except Exception:
-                    logger.exception("Agent error")
-                    continue
-                if result:
-                    logger.success("Correction: {}", result.correction)
-                    src = SOURCES.get(result.source_key, {})
-                    if src.get("url"):
-                        logger.info("Source: {} — {}", src["alias"], src["url"])
-
-                    logger.info("Generating speech...")
-                    try:
-                        first_chunk = True
-                        async for audio_chunk in text_to_speech_stream(tts_client, result.correction, settings):
-                            if first_chunk:
-                                first_chunk = False
-                                try:
-                                    await interrupt_svc.wait_for_interrupt_window()
-                                except Exception:
-                                    logger.warning("Turn detector error, speaking immediately")
-                                logger.info("Speaking...")
-                            write_chunk(audio_out, audio_chunk)
-                    except Exception:
-                        logger.exception("TTS error")
+                task = asyncio.create_task(_analyze(chunk))
+                analysis_tasks.add(task)
+                task.add_done_callback(analysis_tasks.discard)
         except KeyboardInterrupt:
             logger.info("Shutting down...")
         finally:
+            await correction_queue.put(None)
+            await delivery_task
+            for t in analysis_tasks:
+                t.cancel()
             bridge_task.cancel()
+            await tts_session.close()
+            await agent.close()
             await interrupt_svc.stop()
             await mic_input.stop()
             audio_out.stop()

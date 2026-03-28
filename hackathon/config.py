@@ -27,10 +27,11 @@ class ProjectSettings(BaseSettings):
     microphone_device: str | None = None
     microphone_sample_rate_hz: int = Field(default=16000, gt=0)
     microphone_chunk_ms: Literal[20] = 20
-    microphone_queue_size: int = Field(default=5, gt=0)
+    microphone_queue_size: int = Field(default=100, gt=0)
     turn_detector_silence_ms: int = Field(default=700, gt=0)
     turn_detector_max_wait_ms: int = Field(default=10_000, gt=0)
     turn_detector_vad_mode: int = Field(default=2, ge=0, le=3)
+    use_turn_detector: bool = True  # False = play correction immediately without waiting for silence
     eager_alert: bool = True  # True = show alert immediately; False = wait for first TTS chunk
 
     def microphone_device_selector(self) -> str | int | None:
