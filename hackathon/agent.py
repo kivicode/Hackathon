@@ -96,13 +96,12 @@ Contradiction: {contradiction_summary}
 
 Compose the correction:"""
 
+RagFn = Callable[[str, str], list[Evidence]]
+
 
 # ---------------------------------------------------------------------------
 # MeetingAgent
 # ---------------------------------------------------------------------------
-
-RagFn = Callable[[str, str], list[Evidence]]
-DeliveryFn = Callable[[str], None]
 
 
 class MeetingAgent:
@@ -110,13 +109,11 @@ class MeetingAgent:
         self,
         settings: ProjectSettings,
         rag_fn: RagFn,
-        delivery_fn: DeliveryFn,
     ) -> None:
         self.client = genai.Client(api_key=settings.gemini_api_key)
         self.model = settings.gemini_model
         self.transcript: deque[TranscriptChunk] = deque(maxlen=settings.buffer_size)
         self.rag_fn = rag_fn
-        self.delivery_fn = delivery_fn
         self.confidence_threshold = settings.confidence_threshold
 
     async def process_chunk(self, chunk: TranscriptChunk) -> str | None:
@@ -139,9 +136,7 @@ class MeetingAgent:
             if contradiction.confidence < self.confidence_threshold:
                 continue
 
-            correction = await self._build_correction(claim, evidence, contradiction, context)
-            self.delivery_fn(correction)
-            return correction
+            return await self._build_correction(claim, evidence, contradiction, context)
 
         return None
 
