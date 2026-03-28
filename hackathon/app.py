@@ -1,8 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-import google.genai as genai
 from fastapi import FastAPI
+from google import genai
 from pydantic import BaseModel
 
 from hackathon.config import ProjectSettings
