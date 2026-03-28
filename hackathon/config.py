@@ -11,3 +11,7 @@ class ProjectSettings(BaseSettings):
     voice_name: str = "Kore"
     audio_device: str = "BlackHole 2ch"
     sample_rate: int = 24000
+
+    rag_mode: str = "stuffing"
+    rag_data_dir: str = "data"
+    rag_working_dir: str = "rag_storage"
