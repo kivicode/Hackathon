@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import google.genai as genai
+from google import genai
 
 from hackathon.rag.base import RAGBackend
 

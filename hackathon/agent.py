@@ -49,7 +49,8 @@ Your knowledge base (Jira, Slack, financial reports):
 CRITICAL rules:
 - NEVER intervene on questions. "Is it ready?" is a question — do NOT respond.
 - ONLY intervene when someone ASSERTS a fact that is wrong. E.g. "Yes, we finished it" when records show it's not done.
-- Also flag when someone proposes an action based on incomplete data (e.g. "we should cut them" when the financials show the trend is improving).
+- Also flag when someone proposes an action based on incomplete data
+  (e.g. "we should cut them" when the financials show the trend is improving).
 - Do NOT intervene if the knowledge base has no relevant information.
 - Be brief: 1-2 sentences max. Cite the source (Jira, Slack, financial report).
 - Start with: "Small correction:", "Worth noting:", or "Caution:"
@@ -166,7 +167,11 @@ if __name__ == "__main__":
     from hackathon.config import ProjectSettings
 
     DEMO_TRANSCRIPT = [
-        ("CEO", "We've got a lead, XYZ Corp. They're interested in Feature X. I'm meeting them tomorrow, is it ready?"),
+        (
+            "CEO",
+            "We've got a lead, XYZ Corp. They're interested in Feature X. "
+            "I'm meeting them tomorrow, is it ready?",
+        ),
         ("CTO", "Yes, we finished it this week."),
         (
             "CTO",
