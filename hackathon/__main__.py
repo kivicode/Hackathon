@@ -8,7 +8,7 @@ import time
 
 from hackathon.agent import MeetingAgent, TranscriptChunk
 from hackathon.config import ProjectSettings
-from hackathon.rag import mock_rag
+from hackathon.rag import load_knowledge_base
 from hackathon.stt import ResumableMicrophoneStream, generate_transcripts
 from hackathon.voiceover.audio import open_stream, write_chunk
 from hackathon.voiceover.tts import create_client, text_to_speech_stream
@@ -22,16 +22,23 @@ logger = logging.getLogger(__name__)
 
 async def run() -> None:
     settings = ProjectSettings()
+    loop = asyncio.get_event_loop()
 
     # -- TTS setup --
     tts_client = create_client(settings)
     audio_out = open_stream(settings.audio_device, settings.sample_rate)
 
     # -- Agent setup --
-    agent = MeetingAgent(settings=settings, rag_fn=mock_rag)
+    knowledge = load_knowledge_base()
+    agent = MeetingAgent(settings=settings, knowledge_base=knowledge)
+    logger.info("Loaded %d chars of knowledge base", len(knowledge))
 
-    # -- STT in background thread → asyncio queue --
+    # -- Thread-safe queue bridge --
     transcript_queue: asyncio.Queue[TranscriptChunk | None] = asyncio.Queue()
+
+    def _put_chunk(chunk: TranscriptChunk | None) -> None:
+        """Thread-safe put into the asyncio queue."""
+        loop.call_soon_threadsafe(transcript_queue.put_nowait, chunk)
 
     def _stt_worker() -> None:
         mic = ResumableMicrophoneStream()
@@ -43,7 +50,7 @@ async def run() -> None:
                         text=event.text,
                         timestamp=time.time(),
                     )
-                    transcript_queue.put_nowait(chunk)
+                    _put_chunk(chunk)
                     logger.info("STT: %s", event.text)
                 else:
                     logger.debug("STT (interim): %s", event.text)
@@ -51,9 +58,9 @@ async def run() -> None:
             pass
         finally:
             mic.close()
-            transcript_queue.put_nowait(None)
+            _put_chunk(None)
 
-    stt_task = asyncio.get_event_loop().run_in_executor(None, _stt_worker)
+    stt_task = loop.run_in_executor(None, _stt_worker)
 
     # -- Main loop: consume transcript → run agent → voice corrections --
     logger.info("Pipeline running. Speak into the mic...")
@@ -62,11 +69,22 @@ async def run() -> None:
             chunk = await transcript_queue.get()
             if chunk is None:
                 break
-            correction = await agent.process_chunk(chunk)
+            if not chunk.text.strip():
+                continue
+            logger.info("Processing chunk: %s", chunk.text[:80])
+            try:
+                correction = await agent.process_chunk(chunk)
+            except Exception:
+                logger.exception("Agent error")
+                continue
             if correction:
                 logger.info("Voicing correction: %s", correction)
-                async for audio_chunk in text_to_speech_stream(tts_client, correction, settings):
-                    write_chunk(audio_out, audio_chunk)
+                try:
+                    async for audio_chunk in text_to_speech_stream(tts_client, correction, settings):
+                        write_chunk(audio_out, audio_chunk)
+                    logger.info("Correction voiced successfully")
+                except Exception:
+                    logger.exception("TTS error")
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
