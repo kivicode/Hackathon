@@ -1,13 +1,16 @@
-# Byte-compiled / optimized files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
 # Virtual environments
 .venv/
 venv/
 env/
 ENV/
+env.bak/
+venv.bak/
 
 # Tool caches
 .ruff_cache/
@@ -17,19 +20,49 @@ ENV/
 .hypothesis/
 .tox/
 .nox/
+.cache
+.pybuilder/
+.pytype/
+.dmypy.json
+dmypy.json
 
 # Coverage and test output
 .coverage
 .coverage.*
 htmlcov/
+coverage.xml
+nosetests.xml
+*.cover
+*.py,cover
+cover/
 
-# Build artifacts
+# Build artifacts / packaging
+.Python
 build/
+develop-eggs/
 dist/
-site/
+downloads/
+eggs/
 .eggs/
+lib/
+lib64/
+parts/
+sdist/
+site/
+var/
+wheels/
+share/python-wheels/
 *.egg-info/
 pip-wheel-metadata/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+*.onefile-build/
+*.build/
+*.dist/
+target/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
@@ -39,7 +72,21 @@ pip-wheel-metadata/
 .env.*
 !.env.example
 
+# App / local runtime artifacts
+instance/
+db.sqlite3
+db.sqlite3-journal
+local_settings.py
+rag_storage/
+DevExperiment
+__workspace__
+.history
+_version.py
+
 # OS / editor files
 .DS_Store
 .idea/
 .vscode/
+.spyderproject
+.spyproject
+.ropeproject
